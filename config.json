@@ -1,0 +1,16 @@
+{
+  "auth0_domain": "your-tenant.auth0.com",
+  "edge_client_id": "EDGE_CLIENT_ID",
+  "edge_client_secret": "EDGE_CLIENT_SECRET",
+  "tools": {
+    "petstore": {
+      "openapi_url": "https://petstore3.swagger.io/api/v3/openapi.json",
+      "audience": "https://edge-api.yourcorp.com/petstore"
+    },
+    "userapi": {
+      "openapi_url": "https://example.com/user/openapi.json",
+      "audience": "https://edge-api.yourcorp.com/user"
+    }
+  }
+}
+
