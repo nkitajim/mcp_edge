@@ -1,17 +1,13 @@
 auth0:
-  domain: your-tenant.region.auth0.com
-  # Edge→Auth0 で M2M を使う想定（ツール毎にclientを分けてもOK）
-  client_id: ${AUTH0_CLIENT_ID}
-  client_secret: ${AUTH0_CLIENT_SECRET}
-  use_dpop: false           # trueでDPoPを使うならEdgeでJWK管理
-  token_cache_ttl_sec: 120  # 取得トークンのキャッシュ秒
+  domain: your-tenant.auth0.com
+  client_id: EDGE_CLIENT_ID
+  client_secret: EDGE_CLIENT_SECRET
+  edge_audience: https://edge-api.yourcorp.com
 
 tools:
-  git:
-    openapi: https://api.example.internal/git/openapi.json
-    audience: https://api.example.internal/git
-    scopes: ["repo:read", "repo:write"]
-  db:
-    openapi: https://api.example.internal/db/openapi.json
-    audience: https://api.example.internal/db
-    scopes: ["db:query"]
+  hr_api:
+    audience: https://hr-api.yourcorp.com
+    openapi: https://hr-api.yourcorp.com/openapi.json
+  crm_api:
+    audience: https://crm-api.yourcorp.com
+    openapi: https://crm-api.yourcorp.com/openapi.json

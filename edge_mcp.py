@@ -1,26 +1,40 @@
-import json
+import os
+import yaml
 import httpx
-import jwt
+from typing import Dict, Any
 from fastapi import FastAPI, Depends, HTTPException
 from mcp.server.fastmcp import FastMCPServer
 from mcp.server.fastmcp.tools import tool
-from mcp.server.auth import verify_jwt
-from typing import Dict, Any
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from authlib.integrations.httpx_client import AsyncOAuth2Client
 
-AUTH0_DOMAIN = "your-tenant.auth0.com"
-EDGE_AUDIENCE = "https://edge-api.yourcorp.com"
-AUTH0_CLIENT_ID = "edge-client-id"
-AUTH0_CLIENT_SECRET = "edge-client-secret"
+# =====================
+# Load config
+# =====================
+with open("config.yaml", "r") as f:
+    CFG = yaml.safe_load(f)
 
-# ツールごとにAudienceを定義
-TOOL_AUDIENCES = {
-    "hr_api": "https://hr-api.yourcorp.com",
-    "crm_api": "https://crm-api.yourcorp.com",
-}
+AUTH0_DOMAIN = CFG["auth0"]["domain"]
+AUTH0_CLIENT_ID = CFG["auth0"]["client_id"]
+AUTH0_CLIENT_SECRET = CFG["auth0"]["client_secret"]
+EDGE_AUDIENCE = CFG["auth0"]["edge_audience"]
 
-# STS (on-behalf-of) フロー
-async def get_tool_token(user_token: str, audience: str) -> str:
+TOOLS_CFG = CFG["tools"]
+
+security = HTTPBearer()
+
+# =====================
+# Auth0 JWT 検証（Edge Audience）
+# =====================
+async def get_user_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
+    token = credentials.credentials
+    # 本番では JWKS 検証を実装
+    return token  # 簡易: token をそのまま返す
+
+# =====================
+# STS / OBO でツールAudience用トークン取得
+# =====================
+async def get_tool_token(user_token: str, tool_audience: str) -> str:
     async with AsyncOAuth2Client(
         client_id=AUTH0_CLIENT_ID,
         client_secret=AUTH0_CLIENT_SECRET,
@@ -31,44 +45,59 @@ async def get_tool_token(user_token: str, audience: str) -> str:
                 "grant_type": "urn:ietf:params:oauth:grant-type:jwt-bearer",
                 "client_id": AUTH0_CLIENT_ID,
                 "client_secret": AUTH0_CLIENT_SECRET,
-                "audience": audience,
                 "assertion": user_token,
+                "audience": tool_audience,
                 "scope": "openid profile email",
             },
         )
         if resp.status_code != 200:
-            raise HTTPException(status_code=401, detail="STS failed")
+            raise HTTPException(status_code=401, detail=f"STS failed: {resp.text}")
         return resp.json()["access_token"]
 
-# OpenAPIからMCPツールを動的生成
-async def register_openapi_tools(server: FastMCPServer, api_name: str, openapi_url: str):
-    async with httpx.AsyncClient() as client:
-        resp = await client.get(openapi_url)
-        spec = resp.json()
+# =====================
+# OpenAPI -> MCP Tool 動的生成
+# =====================
+async def register_openapi_tools(server: FastMCPServer):
+    for tool_name, cfg in TOOLS_CFG.items():
+        openapi_url = cfg["openapi"]
+        audience = cfg["audience"]
 
-    for path, methods in spec["paths"].items():
-        for method, op in methods.items():
-            op_id = op.get("operationId", f"{method}_{path}")
-            summary = op.get("summary", "no summary")
+        async with httpx.AsyncClient() as client:
+            r = await client.get(openapi_url)
+            r.raise_for_status()
+            spec = r.json()
 
-            @tool(name=f"{api_name}_{op_id}", description=summary)
-            async def dynamic_tool(params: Dict[str, Any], token: str = Depends(verify_jwt)):
-                # AudienceごとのSTSトークン発行
-                tool_token = await get_tool_token(token, TOOL_AUDIENCES[api_name])
+        for path, methods in spec.get("paths", {}).items():
+            for method, operation in methods.items():
+                if not isinstance(operation, dict):
+                    continue
+                op_id = operation.get("operationId", f"{method}_{path}")
+                summary = operation.get("summary", f"{method.upper()} {path}")
 
-                headers = {"Authorization": f"Bearer {tool_token}"}
-                async with httpx.AsyncClient() as client:
-                    url = f"{spec['servers'][0]['url']}{path}"
-                    resp = await client.request(method.upper(), url, headers=headers, json=params)
-                    return resp.json()
+                @tool(name=f"{tool_name}_{op_id}", description=summary)
+                async def dynamic_tool(params: Dict[str, Any], token: str = Depends(get_user_token), _aud=audience, _path=path, _method=method):
+                    # ツールAudience用の短命トークンをSTSで取得
+                    tool_token = await get_tool_token(token, _aud)
+                    headers = {"Authorization": f"Bearer {tool_token}"}
+                    url = f"{spec['servers'][0]['url']}{_path}"
+                    async with httpx.AsyncClient() as client:
+                        resp = await client.request(_method.upper(), url, headers=headers, json=params)
+                        try:
+                            return resp.json()
+                        except Exception:
+                            return {"status": resp.status_code, "text": resp.text}
 
-            server.register_tool(dynamic_tool)
+                server.register_tool(dynamic_tool)
 
-# MCP Server 初期化
+# =====================
+# MCP サーバ起動
+# =====================
 app = FastAPI()
 mcp = FastMCPServer(app, title="Edge MCP")
 
 @app.on_event("startup")
 async def startup_event():
-    await register_openapi_tools(mcp, "hr_api", "https://hr-api.yourcorp.com/openapi.json")
-    await register_openapi_tools(mcp, "crm_api", "https://crm-api.yourcorp.com/openapi.json")
+    await register_openapi_tools(mcp)
+
+app.mount("/mcp", mcp.app)
+
