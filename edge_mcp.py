@@ -1,108 +1,74 @@
 import json
 import httpx
-from fastapi import FastAPI, Depends, Request
-from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from jose import jwt, JWTError
+import jwt
+from fastapi import FastAPI, Depends, HTTPException
 from mcp.server.fastmcp import FastMCPServer
-from mcp.server import tool
-import inspect
-from typing import Any, Dict
+from mcp.server.fastmcp.tools import tool
+from mcp.server.auth import verify_jwt
+from typing import Dict, Any
+from authlib.integrations.httpx_client import AsyncOAuth2Client
 
-# =====================
-# 設定
-# =====================
 AUTH0_DOMAIN = "your-tenant.auth0.com"
-API_AUDIENCE = "https://your-api.example.com"
-ALGORITHMS = ["RS256"]
+EDGE_AUDIENCE = "https://edge-api.yourcorp.com"
+AUTH0_CLIENT_ID = "edge-client-id"
+AUTH0_CLIENT_SECRET = "edge-client-secret"
 
-OPENAPI_URL = "https://your-api.example.com/openapi.json"
+# ツールごとにAudienceを定義
+TOOL_AUDIENCES = {
+    "hr_api": "https://hr-api.yourcorp.com",
+    "crm_api": "https://crm-api.yourcorp.com",
+}
 
-# =====================
-# 認証
-# =====================
-security = HTTPBearer()
+# STS (on-behalf-of) フロー
+async def get_tool_token(user_token: str, audience: str) -> str:
+    async with AsyncOAuth2Client(
+        client_id=AUTH0_CLIENT_ID,
+        client_secret=AUTH0_CLIENT_SECRET,
+    ) as client:
+        resp = await client.post(
+            f"https://{AUTH0_DOMAIN}/oauth/token",
+            data={
+                "grant_type": "urn:ietf:params:oauth:grant-type:jwt-bearer",
+                "client_id": AUTH0_CLIENT_ID,
+                "client_secret": AUTH0_CLIENT_SECRET,
+                "audience": audience,
+                "assertion": user_token,
+                "scope": "openid profile email",
+            },
+        )
+        if resp.status_code != 200:
+            raise HTTPException(status_code=401, detail="STS failed")
+        return resp.json()["access_token"]
 
-async def get_token_auth(credentials: HTTPAuthorizationCredentials = Depends(security)):
-    token = credentials.credentials
-    try:
-        jwks_url = f"https://{AUTH0_DOMAIN}/.well-known/jwks.json"
-        jwks = httpx.get(jwks_url).json()
-        unverified_header = jwt.get_unverified_header(token)
-        rsa_key = {}
-        for key in jwks["keys"]:
-            if key["kid"] == unverified_header["kid"]:
-                rsa_key = {
-                    "kty": key["kty"],
-                    "kid": key["kid"],
-                    "use": key["use"],
-                    "n": key["n"],
-                    "e": key["e"],
-                }
-        if rsa_key:
-            payload = jwt.decode(
-                token,
-                rsa_key,
-                algorithms=ALGORITHMS,
-                audience=API_AUDIENCE,
-                issuer=f"https://{AUTH0_DOMAIN}/",
-            )
-            return payload
-    except JWTError as e:
-        raise Exception("Invalid token") from e
-    raise Exception("Authentication failed")
+# OpenAPIからMCPツールを動的生成
+async def register_openapi_tools(server: FastMCPServer, api_name: str, openapi_url: str):
+    async with httpx.AsyncClient() as client:
+        resp = await client.get(openapi_url)
+        spec = resp.json()
 
-# =====================
-# OpenAPI 読み込み & MCP ツール生成
-# =====================
-def load_openapi_schema() -> Dict[str, Any]:
-    resp = httpx.get(OPENAPI_URL)
-    resp.raise_for_status()
-    return resp.json()
+    for path, methods in spec["paths"].items():
+        for method, op in methods.items():
+            op_id = op.get("operationId", f"{method}_{path}")
+            summary = op.get("summary", "no summary")
 
-def create_tool_from_operation(path: str, method: str, operation: Dict[str, Any]):
-    """operationId ごとに tool 関数を生成"""
-    op_id = operation.get("operationId")
-    summary = operation.get("summary", f"{method.upper()} {path}")
-    parameters = operation.get("parameters", [])
+            @tool(name=f"{api_name}_{op_id}", description=summary)
+            async def dynamic_tool(params: Dict[str, Any], token: str = Depends(verify_jwt)):
+                # AudienceごとのSTSトークン発行
+                tool_token = await get_tool_token(token, TOOL_AUDIENCES[api_name])
 
-    # パラメータ定義を pydantic のモデル化（ここでは簡易 dict → kwargs）
-    async def dynamic_tool(**kwargs):
-        async with httpx.AsyncClient() as client:
-            url = OPENAPI_URL.replace("/openapi.json", path)
-            headers = {"Authorization": f"Bearer {kwargs.pop('token', '')}"}
-            response = await client.request(method.upper(), url, params=kwargs, headers=headers)
-            return response.json()
+                headers = {"Authorization": f"Bearer {tool_token}"}
+                async with httpx.AsyncClient() as client:
+                    url = f"{spec['servers'][0]['url']}{path}"
+                    resp = await client.request(method.upper(), url, headers=headers, json=params)
+                    return resp.json()
 
-    dynamic_tool.__name__ = op_id or f"{method}_{path}"
-    dynamic_tool.__doc__ = summary
+            server.register_tool(dynamic_tool)
 
-    return tool(name=op_id or f"{method}_{path}", desc=summary)(dynamic_tool)
-
-# =====================
-# MCP サーバ構築
-# =====================
-mcp = FastMCPServer("edge-mcp")
-
-def register_openapi_tools():
-    schema = load_openapi_schema()
-    for path, path_item in schema.get("paths", {}).items():
-        for method, operation in path_item.items():
-            if not isinstance(operation, dict):
-                continue
-            try:
-                t = create_tool_from_operation(path, method, operation)
-                mcp.register_tool(t)
-            except Exception as e:
-                print(f"Failed to register tool for {method.upper()} {path}: {e}")
-
-# =====================
-# FastAPI + MCP 起動
-# =====================
+# MCP Server 初期化
 app = FastAPI()
+mcp = FastMCPServer(app, title="Edge MCP")
 
 @app.on_event("startup")
 async def startup_event():
-    register_openapi_tools()
-
-# FastMCP 用エンドポイント
-app.mount("/mcp", mcp.app)
+    await register_openapi_tools(mcp, "hr_api", "https://hr-api.yourcorp.com/openapi.json")
+    await register_openapi_tools(mcp, "crm_api", "https://crm-api.yourcorp.com/openapi.json")
