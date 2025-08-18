@@ -1,15 +1,16 @@
-import os
 import yaml
 import httpx
 from typing import Dict, Any
-from fastapi import FastAPI, Depends, HTTPException
-from mcp.server.fastmcp import FastMCPServer
-from mcp.server.fastmcp.tools import tool
+from fastapi import FastAPI, Depends, HTTPException, HTTPException
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from authlib.integrations.httpx_client import AsyncOAuth2Client
+from mcp.server.fastmcp import FastMCP
+
+from jwt import PyJWKClient
+from datetime import datetime
 
 # =====================
-# Load config
+# config
 # =====================
 with open("config.yaml", "r") as f:
     CFG = yaml.safe_load(f)
@@ -18,21 +19,55 @@ AUTH0_DOMAIN = CFG["auth0"]["domain"]
 AUTH0_CLIENT_ID = CFG["auth0"]["client_id"]
 AUTH0_CLIENT_SECRET = CFG["auth0"]["client_secret"]
 EDGE_AUDIENCE = CFG["auth0"]["edge_audience"]
-
 TOOLS_CFG = CFG["tools"]
+
+# JWKS クライアントを作成
+ISSUER = f"https://{AUTH0_DOMAIN}/"
+jwks_url = f"{ISSUER}.well-known/jwks.json"
+jwks_client = PyJWKClient(jwks_url)
 
 security = HTTPBearer()
 
 # =====================
-# Auth0 JWT 検証（Edge Audience）
+# Edge Audience トークン検証
 # =====================
-async def get_user_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
-    token = credentials.credentials
-    # 本番では JWKS 検証を実装
-    return token  # 簡易: token をそのまま返す
+async def verify_edge_token(token: str) -> dict:
+    """
+    Auth0 JWT トークンを正式に検証する
+    - 署名検証
+    - aud, iss チェック
+    - exp チェック
+    """
+    try:
+        signing_key = jwks_client.get_signing_key_from_jwt(token).key
+        payload = jwt.decode(
+            token,
+            signing_key,
+            algorithms=["RS256"],
+            audience=EDGE_AUDIENCE,
+            issuer=ISSUER,
+        )
+
+        # 追加で必要なら role などをチェック
+        if "sub" not in payload:
+            raise HTTPException(status_code=401, detail="Invalid token: sub missing")
+
+        # exp 自動検証されるが、念のため確認
+        exp = payload.get("exp")
+        if exp is None or datetime.utcfromtimestamp(exp) < datetime.utcnow():
+            raise HTTPException(status_code=401, detail="Token expired")
+
+        return payload
+
+    except jwt.ExpiredSignatureError:
+        raise HTTPException(status_code=401, detail="Token expired")
+    except jwt.JWTClaimsError as e:
+        raise HTTPException(status_code=401, detail=f"Invalid claims: {str(e)}")
+    except Exception as e:
+        raise HTTPException(status_code=401, detail=f"Invalid token: {str(e)}")
 
 # =====================
-# STS / OBO でツールAudience用トークン取得
+# STS/OBO でツール Audience 用トークン取得
 # =====================
 async def get_tool_token(user_token: str, tool_audience: str) -> str:
     async with AsyncOAuth2Client(
@@ -57,7 +92,7 @@ async def get_tool_token(user_token: str, tool_audience: str) -> str:
 # =====================
 # OpenAPI -> MCP Tool 動的生成
 # =====================
-async def register_openapi_tools(server: FastMCPServer):
+async def register_openapi_tools(server: FastMCP):
     for tool_name, cfg in TOOLS_CFG.items():
         openapi_url = cfg["openapi"]
         audience = cfg["audience"]
@@ -74,12 +109,10 @@ async def register_openapi_tools(server: FastMCPServer):
                 op_id = operation.get("operationId", f"{method}_{path}")
                 summary = operation.get("summary", f"{method.upper()} {path}")
 
-                @tool(name=f"{tool_name}_{op_id}", description=summary)
-                async def dynamic_tool(params: Dict[str, Any], token: str = Depends(get_user_token), _aud=audience, _path=path, _method=method):
-                    # ツールAudience用の短命トークンをSTSで取得
+                async def dynamic_tool(params: Dict[str, Any], token: str = Depends(get_user_token), _aud=audience, _path=path, _method=method, _spec=spec):
                     tool_token = await get_tool_token(token, _aud)
                     headers = {"Authorization": f"Bearer {tool_token}"}
-                    url = f"{spec['servers'][0]['url']}{_path}"
+                    url = f"{_spec['servers'][0]['url']}{_path}"
                     async with httpx.AsyncClient() as client:
                         resp = await client.request(_method.upper(), url, headers=headers, json=params)
                         try:
@@ -87,17 +120,18 @@ async def register_openapi_tools(server: FastMCPServer):
                         except Exception:
                             return {"status": resp.status_code, "text": resp.text}
 
-                server.register_tool(dynamic_tool)
+                # FastMCP に直接登録
+                server.register_tool(dynamic_tool, name=f"{tool_name}_{op_id}", description=summary)
 
 # =====================
-# MCP サーバ起動
+# FastAPI + MCP
 # =====================
 app = FastAPI()
-mcp = FastMCPServer(app, title="Edge MCP")
+mcp = FastMCP(app, title="Edge MCP")  # ここで FastAPI app をラップする
 
 @app.on_event("startup")
 async def startup_event():
     await register_openapi_tools(mcp)
 
-app.mount("/mcp", mcp.app)
-
+# ※ app.mount("/mcp", mcp.app) は不要
+# MCP エンドポイントは自動で FastAPI app に組み込まれる
