@@ -1,0 +1,2 @@
+fastapi
+PyJWT[crypto] httpx
