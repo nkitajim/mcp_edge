@@ -78,10 +78,13 @@ async def verify_token(credentials: HTTPAuthorizationCredentials = Depends(secur
     return payload
 
 
-@app.get("/auth_user/", tags=["user"])
-async def get_auth_user(auth_user: dict = Depends(verify_token)):
-    return {"name": auth_user}
+class User(BaseModel):
+    name: str
 
-@app.get("/users/{user}", tags=["user"])
-async def get_user(auth_user: dict = Depends(verify_token)):
-    return {"name": "nkitajim"}
+@app.get("/auth_user/", summary="get auth user", description="return your auth user", tags=["user"])
+async def get_auth_user(auth_user: dict = Depends(verify_token)):
+    return auth_user
+
+@app.get("/users/{user}", summary="get user", description="return user", tags=["user"], response_model=User)
+async def get_user(user:str, auth_user: dict = Depends(verify_token)):
+    return {"name": user}
